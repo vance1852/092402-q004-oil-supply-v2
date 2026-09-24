@@ -107,6 +107,7 @@ class SupplyServiceTests(unittest.TestCase):
 
     def test_scenario_is_approved_and_replayed_by_input(self) -> None:
         self.quote(23, "98")
+        self.service.record_quote("plan", {"price_index": "BRENT", "trade_date": "2026-09-23", "close_usd": "98.10", "source_revision": "r-23-b", "observed_at": "2026-09-23T21:05:00Z"})
         self.service.add_inventory_lot("dispatch", {"lot_id": "lot-1", "facility_id": "field-a", "product": "crude", "grade": "BRENT", "quantity_barrels": "60000", "unit_cost_usd": "91", "received_at": "2026-09-24T06:00:00Z"})
         self.service.create_scenario("plan", {"scenario_id": "restart", "name": "管道恢复", "price_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
         with self.assertRaises(Forbidden):

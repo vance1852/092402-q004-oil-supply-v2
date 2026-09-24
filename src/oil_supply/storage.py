@@ -35,6 +35,93 @@ CREATE TABLE IF NOT EXISTS price_index_quotes (
 CREATE INDEX IF NOT EXISTS idx_quotes_series
 ON price_index_quotes(price_index, trade_date, quote_id);
 
+CREATE TABLE IF NOT EXISTS price_dispute_settings (
+    price_index TEXT PRIMARY KEY,
+    tolerance_usd TEXT NOT NULL,
+    updated_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS price_disputes (
+    dispute_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    price_index TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    round_no INTEGER NOT NULL,
+    tolerance_usd TEXT NOT NULL,
+    spread_usd TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('open','decided','returned')),
+    opened_by TEXT,
+    opened_at TEXT NOT NULL,
+    decided_at TEXT,
+    decision_reason TEXT,
+    UNIQUE(price_index, trade_date, round_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_disputes_state
+ON price_disputes(state, price_index, trade_date);
+
+CREATE TABLE IF NOT EXISTS price_dispute_candidates (
+    dispute_id INTEGER NOT NULL REFERENCES price_disputes(dispute_id),
+    quote_id INTEGER NOT NULL REFERENCES price_index_quotes(quote_id),
+    added_at TEXT NOT NULL,
+    PRIMARY KEY(dispute_id, quote_id)
+);
+
+CREATE TABLE IF NOT EXISTS price_confirmations (
+    confirmation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    price_index TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    round_no INTEGER NOT NULL,
+    dispute_id INTEGER REFERENCES price_disputes(dispute_id),
+    close_usd TEXT NOT NULL,
+    basis TEXT NOT NULL CHECK(basis IN ('auto_matched','candidate_selected','adjudicated')),
+    source_quote_id INTEGER REFERENCES price_index_quotes(quote_id),
+    consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0,1)),
+    decided_by TEXT REFERENCES supply_users(user_id),
+    decided_at TEXT NOT NULL,
+    UNIQUE(price_index, trade_date, round_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_confirmations_series
+ON price_confirmations(price_index, trade_date, confirmation_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_confirmation_lock_update
+BEFORE UPDATE ON price_confirmations
+WHEN OLD.consumed=1 AND (
+    NEW.price_index IS NOT OLD.price_index
+    OR NEW.trade_date IS NOT OLD.trade_date
+    OR NEW.round_no IS NOT OLD.round_no
+    OR NEW.dispute_id IS NOT OLD.dispute_id
+    OR NEW.close_usd IS NOT OLD.close_usd
+    OR NEW.basis IS NOT OLD.basis
+    OR NEW.source_quote_id IS NOT OLD.source_quote_id
+    OR NEW.decided_by IS NOT OLD.decided_by
+    OR NEW.decided_at IS NOT OLD.decided_at
+    OR NEW.consumed=0
+)
+BEGIN
+    SELECT RAISE(ABORT, '已使用的复核结论不可覆盖');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_confirmation_lock_delete
+BEFORE DELETE ON price_confirmations
+WHEN OLD.consumed=1
+BEGIN
+    SELECT RAISE(ABORT, '已使用的复核结论不可删除');
+END;
+
+CREATE TABLE IF NOT EXISTS price_valuation_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    price_index TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    confirmation_id INTEGER NOT NULL REFERENCES price_confirmations(confirmation_id),
+    close_usd TEXT NOT NULL,
+    positions_json TEXT NOT NULL,
+    valuation_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS facilities (
     facility_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -198,7 +285,9 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(
+        str(path), isolation_level=None, timeout=10, check_same_thread=False
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

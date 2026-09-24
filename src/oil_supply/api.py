@@ -59,8 +59,31 @@ class JsonApplication:
                 return Response(201, self.service.create_user(payload["user_id"], payload["display_name"], payload["role"]))
             if method == "POST" and path == "/quotes":
                 return Response(201, self.service.record_quote(actor, payload))
+            if method == "POST" and path == "/quotes/tolerance":
+                return Response(200, self.service.set_tolerance(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "tolerance"]:
+                return Response(200, self.service.get_tolerance(actor, parts[2]))
             if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:
                 return Response(200, self.service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
+            if method == "GET" and path == "/disputes":
+                return Response(200, self.service.dispute_queue(actor))
+            if method == "GET" and path == "/disputes/history":
+                return Response(
+                    200,
+                    self.service.dispute_history(
+                        actor,
+                        query.get("price_index", [None])[0],
+                        query.get("trade_date", [None])[0],
+                    ),
+                )
+            if method == "GET" and len(parts) == 2 and parts[0] == "disputes":
+                return Response(200, self.service.dispute(actor, int(parts[1])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "disputes" and parts[2] == "decide":
+                return Response(200, self.service.decide_dispute(actor, int(parts[1]), payload))
+            if method == "POST" and path == "/valuations/snapshots":
+                return Response(201, self.service.create_valuation_snapshot(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["valuations", "snapshots"]:
+                return Response(200, self.service.valuation_snapshot(actor, parts[2]))
             if method == "POST" and path == "/facilities":
                 return Response(201, self.service.create_facility(actor, payload))
             if method == "POST" and path == "/routes":
