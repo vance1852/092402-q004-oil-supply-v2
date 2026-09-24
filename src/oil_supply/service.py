@@ -11,7 +11,17 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    CRUDE_GRADES,
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    SupplyScenario,
+    decimal_value,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -27,15 +37,18 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .risk import mark_to_market
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
+    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run", "report.read"},
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
+    "risk": {"outage.write", "scenario.approve", "quote.review", "quote.config", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
+
+DEFAULT_TOLERANCE_USD = Decimal("0.50")
 
 
 class SupplyService:
@@ -115,50 +128,423 @@ class SupplyService:
             raise Conflict("用户已经存在") from exc
         return {"user_id": user_id.strip(), "role": role}
 
+    def _tolerance(self, price_index: str) -> Decimal:
+        row = self.connection.execute(
+            "SELECT tolerance_usd FROM price_dispute_settings WHERE price_index=?",
+            (price_index,),
+        ).fetchone()
+        return DEFAULT_TOLERANCE_USD if row is None else Decimal(row["tolerance_usd"])
+
+    def configure_price_tolerance(self, actor_id: str, price_index: str, tolerance_usd: object) -> dict[str, Any]:
+        self._require(actor_id, "quote.config")
+        tolerance = decimal_value(tolerance_usd, "tolerance_usd", minimum=Decimal("0"))
+        index = required_text(price_index, "price_index", 16).upper()
+        if index not in CRUDE_GRADES - {"CUSTOM"}:
+            raise ValidationFailed("price_index 必须是 BRENT、WTI、DUBAI、ESPO 或 URAL")
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO price_dispute_settings(price_index,tolerance_usd,updated_by,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(price_index) DO UPDATE SET "
+                "tolerance_usd=excluded.tolerance_usd,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                (index, decimal_text(tolerance), actor_id, self._now()),
+            )
+            self._audit("price_index", index, "price.tolerance_configured", actor_id, {"tolerance_usd": decimal_text(tolerance)})
+        return {"price_index": index, "tolerance_usd": decimal_text(tolerance)}
+
     def record_quote(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "quote.write")
         quote = IndexQuote.from_dict(raw)
-        previous = self.connection.execute(
-            "SELECT quote_id,source_revision FROM price_index_quotes WHERE price_index=? AND trade_date=? "
-            "ORDER BY quote_id DESC LIMIT 1",
-            (quote.price_index, quote.trade_date),
-        ).fetchone()
-        if previous is not None and previous["source_revision"] == quote.source_revision:
-            raise Conflict("同一来源修订已登记")
+        tolerance = self._tolerance(quote.price_index)
+        result: dict[str, Any]
         try:
             with transaction(self.connection, immediate=True):
+                duplicate = self.connection.execute(
+                    "SELECT quote_id FROM price_index_quotes WHERE price_index=? AND trade_date=? AND source_revision=?",
+                    (quote.price_index, quote.trade_date, quote.source_revision),
+                ).fetchone()
+                if duplicate is not None:
+                    raise Conflict("同一来源修订已登记")
+                prior = self.connection.execute(
+                    "SELECT quote_id FROM price_index_quotes WHERE price_index=? AND trade_date=? "
+                    "ORDER BY quote_id DESC LIMIT 1",
+                    (quote.price_index, quote.trade_date),
+                ).fetchone()
                 cursor = self.connection.execute(
                     "INSERT INTO price_index_quotes(price_index,trade_date,close_usd,source_revision,observed_at,"
-                    "supersedes_quote_id,recorded_by,recorded_at) VALUES(?,?,?,?,?,?,?,?)",
+                    "supersedes_quote_id,round,recorded_by,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         quote.price_index,
                         quote.trade_date,
                         decimal_text(quote.close_usd),
                         quote.source_revision,
                         quote.observed_at,
-                        None if previous is None else previous["quote_id"],
+                        None if prior is None else prior["quote_id"],
+                        1,
                         actor_id,
                         self._now(),
                     ),
                 )
                 quote_id = int(cursor.lastrowid)
+                outcome = self._classify_quote(quote_id, quote, tolerance)
                 self._audit(
                     "quote",
                     str(quote_id),
                     "quote.recorded",
                     actor_id,
-                    {"price_index": quote.price_index, "trade_date": quote.trade_date},
+                    {"price_index": quote.price_index, "trade_date": quote.trade_date, "outcome": outcome["state"]},
                 )
+                if outcome.get("newly_opened"):
+                    self._audit(
+                        "price_dispute",
+                        str(outcome["dispute_id"]),
+                        "price_dispute.opened",
+                        "system",
+                        {"price_index": quote.price_index, "trade_date": quote.trade_date,
+                         "round": outcome["round"], "max_gap_usd": outcome["max_gap_usd"]},
+                    )
+                result = {"quote_id": quote_id, "price_index": quote.price_index, "trade_date": quote.trade_date,
+                          **{key: value for key, value in outcome.items() if key != "newly_opened"}}
         except sqlite3.IntegrityError as exc:
             raise Conflict("报价版本冲突") from exc
-        return {"quote_id": quote_id, "price_index": quote.price_index, "trade_date": quote.trade_date}
+        return result
+
+    def _candidate_spread(self, price_index: str, trade_date: str) -> Decimal:
+        rows = self.connection.execute(
+            "SELECT close_usd FROM price_index_quotes WHERE price_index=? AND trade_date=?",
+            (price_index, trade_date),
+        ).fetchall()
+        values = [Decimal(row["close_usd"]) for row in rows]
+        return max(values) - min(values)
+
+    def _classify_quote(self, quote_id: int, quote: IndexQuote, tolerance: Decimal) -> dict[str, Any]:
+        """在已持有写事务时判定候选报价：确认、容差内保留或开启争议轮次。"""
+        confirmed = self.connection.execute(
+            "SELECT * FROM price_confirmed_values WHERE price_index=? AND trade_date=? "
+            "ORDER BY round DESC LIMIT 1",
+            (quote.price_index, quote.trade_date),
+        ).fetchone()
+        if confirmed is None:
+            self.connection.execute(
+                "INSERT INTO price_confirmed_values(price_index,trade_date,round,dispute_id,close_usd,basis,"
+                "selected_quote_id,rationale,decided_by,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    quote.price_index,
+                    quote.trade_date,
+                    1,
+                    None,
+                    decimal_text(quote.close_usd),
+                    "auto_single_source",
+                    quote_id,
+                    "唯一授权来源候选，自动确认",
+                    "system",
+                    self._now(),
+                ),
+            )
+            return {"state": "confirmed", "round": 1, "basis": "auto_single_source", "dispute_id": None}
+
+        open_dispute = self.connection.execute(
+            "SELECT * FROM price_disputes WHERE price_index=? AND trade_date=? AND state='open' "
+            "ORDER BY round DESC LIMIT 1",
+            (quote.price_index, quote.trade_date),
+        ).fetchone()
+        if open_dispute is not None:
+            round_no = int(open_dispute["round"])
+            self.connection.execute(
+                "UPDATE price_index_quotes SET round=? WHERE quote_id=?",
+                (round_no, quote_id),
+            )
+            spread = self._candidate_spread(quote.price_index, quote.trade_date)
+            self.connection.execute(
+                "UPDATE price_disputes SET max_gap_usd=? WHERE dispute_id=?",
+                (decimal_text(spread), open_dispute["dispute_id"]),
+            )
+            return {"state": "disputed", "round": round_no, "basis": None, "dispute_id": int(open_dispute["dispute_id"])}
+
+        latest_dispute = self.connection.execute(
+            "SELECT * FROM price_disputes WHERE price_index=? AND trade_date=? ORDER BY round DESC LIMIT 1",
+            (quote.price_index, quote.trade_date),
+        ).fetchone()
+        returned_for_evidence = latest_dispute is not None and latest_dispute["state"] == "returned"
+
+        round_no = int(confirmed["round"])
+        anchor_price = Decimal(confirmed["close_usd"])
+        gap = abs(quote.close_usd - anchor_price)
+        if not returned_for_evidence and confirmed["state"] == "active" and gap <= tolerance:
+            self.connection.execute(
+                "UPDATE price_index_quotes SET round=? WHERE quote_id=?",
+                (round_no, quote_id),
+            )
+            return {"state": "within_tolerance", "round": round_no, "basis": confirmed["basis"], "dispute_id": None}
+
+        # 退回补证后补交证据，或差值超出容差：迟到候选只能开启新一轮争议。
+        dispute_round = self.connection.execute(
+            "SELECT max(round) AS round FROM price_disputes WHERE price_index=? AND trade_date=?",
+            (quote.price_index, quote.trade_date),
+        ).fetchone()["round"]
+        new_round = max(round_no, int(dispute_round or 0)) + 1
+        self.connection.execute(
+            "UPDATE price_index_quotes SET round=? WHERE quote_id=?",
+            (new_round, quote_id),
+        )
+        # 尚未被下游使用的自动确认可以撤回；已使用的结论保持有效且不可覆盖，
+        # 新轮次确认后才在读取侧切换，历史快照不受影响。
+        if confirmed["state"] == "active" and confirmed["consumed_at"] is None:
+            self.connection.execute(
+                "UPDATE price_confirmed_values SET state='superseded' WHERE confirmed_id=?",
+                (confirmed["confirmed_id"],),
+            )
+        spread = self._candidate_spread(quote.price_index, quote.trade_date)
+        cursor = self.connection.execute(
+            "INSERT INTO price_disputes(price_index,trade_date,round,state,tolerance_usd,max_gap_usd,"
+            "anchor_close_usd,opened_by_quote_id,opened_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                quote.price_index,
+                quote.trade_date,
+                new_round,
+                "open",
+                decimal_text(tolerance),
+                decimal_text(spread),
+                decimal_text(anchor_price),
+                quote_id,
+                self._now(),
+            ),
+        )
+        dispute_id = int(cursor.lastrowid)
+        return {"state": "disputed", "round": new_round, "basis": None, "dispute_id": dispute_id,
+                "newly_opened": True, "max_gap_usd": decimal_text(spread)}
+
+    def dispute_queue(self, actor_id: str, price_index: str | None = None) -> dict[str, Any]:
+        self._require(actor_id, "report.read")
+        if price_index is not None:
+            rows = self.connection.execute(
+                "SELECT * FROM price_disputes WHERE state='open' AND price_index=? ORDER BY opened_at,dispute_id",
+                (price_index.upper(),),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM price_disputes WHERE state='open' ORDER BY opened_at,dispute_id"
+            ).fetchall()
+        return {"disputes": [self._dispute_view(row) for row in rows]}
+
+    def _dispute_view(self, row: sqlite3.Row) -> dict[str, Any]:
+        candidates = self.connection.execute(
+            "SELECT quote_id,close_usd,source_revision,observed_at,round,recorded_by,recorded_at "
+            "FROM price_index_quotes WHERE price_index=? AND trade_date=? ORDER BY round,quote_id",
+            (row["price_index"], row["trade_date"]),
+        ).fetchall()
+        latest_confirmed = self.connection.execute(
+            "SELECT close_usd,basis,selected_quote_id,rationale,decided_by,decided_at "
+            "FROM price_confirmed_values WHERE price_index=? AND trade_date=? AND round=? ",
+            (row["price_index"], row["trade_date"], int(row["round"]) - 1),
+        ).fetchone()
+        decision = self.connection.execute(
+            "SELECT action,selected_quote_id,close_usd,rationale,decided_by,decided_at "
+            "FROM price_dispute_decisions WHERE dispute_id=? ORDER BY decision_id DESC LIMIT 1",
+            (row["dispute_id"],),
+        ).fetchone()
+        return {
+            "dispute_id": row["dispute_id"],
+            "price_index": row["price_index"],
+            "trade_date": row["trade_date"],
+            "round": row["round"],
+            "state": row["state"],
+            "tolerance_usd": row["tolerance_usd"],
+            "max_gap_usd": row["max_gap_usd"],
+            "anchor_close_usd": row["anchor_close_usd"],
+            "opened_at": row["opened_at"],
+            "resolved_at": row["resolved_at"],
+            "candidates": [dict(candidate) for candidate in candidates],
+            "prior_confirmed": None if latest_confirmed is None else dict(latest_confirmed),
+            "decision": None if decision is None else dict(decision),
+        }
+
+    def dispute(self, actor_id: str, dispute_id: int) -> dict[str, Any]:
+        self._require(actor_id, "report.read")
+        row = self.connection.execute(
+            "SELECT * FROM price_disputes WHERE dispute_id=?", (dispute_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("争议不存在")
+        return self._dispute_view(row)
+
+    def resolve_dispute(
+        self,
+        actor_id: str,
+        dispute_id: int,
+        action: str,
+        rationale: str,
+        *,
+        selected_quote_id: int | None = None,
+        close_usd: object = None,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "quote.review")
+        if action not in {"select_candidate", "adjudicate", "return"}:
+            raise ValidationFailed("action 必须是 select_candidate、adjudicate 或 return")
+        if not isinstance(rationale, str) or not rationale.strip():
+            raise ValidationFailed("决定依据不能为空")
+        rationale = rationale.strip()
+        if len(rationale) > 1000:
+            raise ValidationFailed("决定依据不能超过 1000 个字符")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT * FROM price_disputes WHERE dispute_id=?", (dispute_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("争议不存在")
+            if row["state"] != "open":
+                raise InvalidState("争议已经结束，结论不可覆盖")
+            submitters = {
+                item["recorded_by"]
+                for item in self.connection.execute(
+                    "SELECT recorded_by FROM price_index_quotes WHERE price_index=? AND trade_date=?",
+                    (row["price_index"], row["trade_date"]),
+                ).fetchall()
+            }
+            if actor_id in submitters:
+                raise Forbidden("提交报价的人不能复核自己的记录")
+
+            chosen_price: Decimal
+            chosen_quote: int | None = None
+            adjudicated = close_usd
+            if action == "select_candidate":
+                if selected_quote_id is None:
+                    raise ValidationFailed("选择候选时必须提供 selected_quote_id")
+                candidate = self.connection.execute(
+                    "SELECT * FROM price_index_quotes WHERE quote_id=? AND price_index=? AND trade_date=?",
+                    (selected_quote_id, row["price_index"], row["trade_date"]),
+                ).fetchone()
+                if candidate is None:
+                    raise ValidationFailed("所选候选不属于该交易日")
+                chosen_price = Decimal(candidate["close_usd"])
+                chosen_quote = int(candidate["quote_id"])
+            elif action == "adjudicate":
+                if adjudicated is None:
+                    raise ValidationFailed("核定决定必须提供 close_usd")
+                chosen_price = decimal_value(adjudicated, "close_usd", minimum=Decimal("0.01"))
+            else:
+                chosen_price = Decimal(row["anchor_close_usd"]) if row["anchor_close_usd"] is not None else Decimal("0")
+
+            cursor = self.connection.execute(
+                "UPDATE price_disputes SET state=?,resolved_at=? WHERE dispute_id=? AND state='open'",
+                ("returned" if action == "return" else "resolved", self._now(), dispute_id),
+            )
+            if cursor.rowcount != 1:
+                raise Conflict("争议已被其他复核人结束")
+            decision_cursor = self.connection.execute(
+                "INSERT INTO price_dispute_decisions(dispute_id,action,selected_quote_id,close_usd,"
+                "rationale,decided_by,decided_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    dispute_id,
+                    action,
+                    chosen_quote,
+                    None if action in {"select_candidate", "return"} else decimal_text(chosen_price),
+                    rationale,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            decision_id = int(decision_cursor.lastrowid)
+            confirmed_id: int | None = None
+            if action != "return":
+                # 前一轮结论的值与依据永不改写；新一轮生效后它仅退出“当前值”位置，
+                # consumed_at 与消费记录保留，历史快照仍可追溯。
+                self.connection.execute(
+                    "UPDATE price_confirmed_values SET state='superseded' "
+                    "WHERE price_index=? AND trade_date=? AND round=? AND state='active'",
+                    (row["price_index"], row["trade_date"], int(row["round"]) - 1),
+                )
+                confirmed_cursor = self.connection.execute(
+                    "INSERT INTO price_confirmed_values(price_index,trade_date,round,dispute_id,close_usd,basis,"
+                    "selected_quote_id,rationale,decided_by,decided_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        row["price_index"],
+                        row["trade_date"],
+                        row["round"],
+                        dispute_id,
+                        decimal_text(chosen_price),
+                        "candidate" if action == "select_candidate" else "adjudicated",
+                        chosen_quote,
+                        rationale,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                confirmed_id = int(confirmed_cursor.lastrowid)
+            self._audit(
+                "price_dispute",
+                str(dispute_id),
+                f"price_dispute.{action}",
+                actor_id,
+                {"decision_id": decision_id, "confirmed_id": confirmed_id},
+            )
+        return {
+            "dispute_id": dispute_id,
+            "decision_id": decision_id,
+            "state": "returned" if action == "return" else "resolved",
+            "confirmed_id": confirmed_id,
+            "close_usd": None if action == "return" else decimal_text(chosen_price),
+        }
+
+    def price_history(self, actor_id: str, price_index: str, trade_date: str) -> dict[str, Any]:
+        self._require(actor_id, "report.read")
+        rows = self.connection.execute(
+            "SELECT quote_id,close_usd,source_revision,observed_at,round,recorded_by,recorded_at "
+            "FROM price_index_quotes WHERE price_index=? AND trade_date=? ORDER BY quote_id",
+            (price_index.upper(), trade_date),
+        ).fetchall()
+        if not rows:
+            raise NotFound("该交易日没有候选报价")
+        confirmed_rows = self.connection.execute(
+            "SELECT confirmed_id,round,dispute_id,close_usd,basis,selected_quote_id,rationale,"
+            "decided_by,decided_at,state,consumed_at FROM price_confirmed_values "
+            "WHERE price_index=? AND trade_date=? ORDER BY round",
+            (price_index.upper(), trade_date),
+        ).fetchall()
+        dispute_rows = self.connection.execute(
+            "SELECT dispute_id,round,state,tolerance_usd,max_gap_usd,anchor_close_usd,opened_at,resolved_at "
+            "FROM price_disputes WHERE price_index=? AND trade_date=? ORDER BY round",
+            (price_index.upper(), trade_date),
+        ).fetchall()
+        decisions = self.connection.execute(
+            "SELECT d.decision_id,d.dispute_id,d.action,d.selected_quote_id,d.close_usd,d.rationale,"
+            "d.decided_by,d.decided_at FROM price_dispute_decisions d "
+            "JOIN price_disputes p ON p.dispute_id=d.dispute_id "
+            "WHERE p.price_index=? AND p.trade_date=? ORDER BY d.decision_id",
+            (price_index.upper(), trade_date),
+        ).fetchall()
+        return {
+            "price_index": price_index.upper(),
+            "trade_date": trade_date,
+            "candidates": [dict(row) for row in rows],
+            "confirmed_values": [dict(row) for row in confirmed_rows],
+            "disputes": [dict(row) for row in dispute_rows],
+            "decisions": [dict(row) for row in decisions],
+        }
+
+    def _confirmed_price_row(self, price_index: str, trade_date: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM price_confirmed_values WHERE price_index=? AND state='active' AND trade_date<=? "
+            "ORDER BY trade_date DESC,round DESC LIMIT 1",
+            (price_index.upper(), trade_date),
+        ).fetchone()
+
+    def _mark_price_consumed(self, confirmed_id: int, consumer: str, reference_id: int) -> None:
+        self.connection.execute(
+            "UPDATE price_confirmed_values SET consumed_at=COALESCE(consumed_at,?) WHERE confirmed_id=?",
+            (self._now(), confirmed_id),
+        )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO price_value_consumptions(confirmed_id,consumer,reference_id,consumed_at) "
+            "VALUES(?,?,?,?)",
+            (confirmed_id, consumer, reference_id, self._now()),
+        )
 
     def price_summary(self, price_index: str, sessions: int = 20) -> dict[str, Any]:
         rows = self.connection.execute(
-            "SELECT q.trade_date,q.close_usd FROM price_index_quotes q "
-            "JOIN (SELECT trade_date,max(quote_id) quote_id FROM price_index_quotes "
-            "WHERE price_index=? GROUP BY trade_date) latest ON latest.quote_id=q.quote_id "
-            "ORDER BY q.trade_date DESC LIMIT ?",
+            "SELECT v.trade_date,v.close_usd FROM price_confirmed_values v WHERE v.price_index=? AND v.state='active' "
+            "AND v.round=(SELECT max(round) FROM price_confirmed_values WHERE price_index=v.price_index "
+            "AND trade_date=v.trade_date AND state='active') "
+            "ORDER BY v.trade_date DESC LIMIT ?",
             (price_index.upper(), sessions),
         ).fetchall()
         points = [PricePoint(row["trade_date"], Decimal(row["close_usd"])) for row in rows]
@@ -174,6 +560,43 @@ class SupplyService:
             "moving_average": None if average is None else decimal_text(average),
             "observations": len(points),
         }
+
+    def valuation_snapshot(self, actor_id: str, as_of_date: str, positions: list[Mapping[str, Any]]) -> dict[str, Any]:
+        self._require(actor_id, "report.read")
+        if not isinstance(positions, list) or not positions:
+            raise ValidationFailed("持仓列表不能为空")
+        normalized = [dict(item) for item in positions]
+        with transaction(self.connection, immediate=True):
+            price_rows: dict[str, sqlite3.Row] = {}
+            for item in normalized:
+                index = str(item.get("price_index", "")).upper()
+                if index not in price_rows:
+                    row = self._confirmed_price_row(index, as_of_date)
+                    if row is None:
+                        raise InvalidState(f"{index} 截止 {as_of_date} 没有已确认值")
+                    price_rows[index] = row
+            prices = {index: Decimal(row["close_usd"]) for index, row in price_rows.items()}
+            result = mark_to_market(normalized, prices)
+            refs = [
+                {
+                    "price_index": index,
+                    "trade_date": row["trade_date"],
+                    "confirmed_id": int(row["confirmed_id"]),
+                    "round": int(row["round"]),
+                    "close_usd": row["close_usd"],
+                }
+                for index, row in sorted(price_rows.items())
+            ]
+            cursor = self.connection.execute(
+                "INSERT INTO valuation_snapshots(as_of_date,result_json,price_refs_json,created_by,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (as_of_date, canonical_json(result), canonical_json(refs), actor_id, self._now()),
+            )
+            snapshot_id = int(cursor.lastrowid)
+            for row in price_rows.values():
+                self._mark_price_consumed(int(row["confirmed_id"]), "valuation_snapshot", snapshot_id)
+            self._audit("valuation_snapshot", str(snapshot_id), "valuation.snapshotted", actor_id, {"as_of_date": as_of_date})
+        return {"snapshot_id": snapshot_id, "as_of_date": as_of_date, "price_refs": refs, **result}
 
     def create_facility(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "catalog.write")
@@ -505,48 +928,47 @@ class SupplyService:
         if row["state"] != "approved":
             raise InvalidState("只有已批准情景可以运行")
         scenario = SupplyScenario.from_dict(json.loads(row["definition_json"]))
-        price_row = self.connection.execute(
-            "SELECT close_usd FROM price_index_quotes WHERE trade_date<=? ORDER BY trade_date DESC,quote_id DESC LIMIT 1",
-            (as_of_date,),
-        ).fetchone()
-        if price_row is None:
-            raise InvalidState("截止日期没有可用报价")
-        routes = self.connection.execute("SELECT * FROM routes WHERE state='active' ORDER BY route_id").fetchall()
-        inventory = self.connection.execute(
-            "SELECT facility_id,product,sum(CAST(available_barrels AS REAL)) available_barrels "
-            "FROM inventory_lots GROUP BY facility_id,product ORDER BY facility_id,product"
-        ).fetchall()
-        input_value = {
-            "scenario_sha256": row["content_sha256"],
-            "as_of_date": as_of_date,
-            "price": price_row["close_usd"],
-            "routes": [dict(item) for item in routes],
-            "inventory": [dict(item) for item in inventory],
-        }
-        input_sha256 = digest(input_value)
-        existing = self.connection.execute(
-            "SELECT run_id,result_json FROM scenario_runs WHERE scenario_id=? AND as_of_date=? AND input_sha256=?",
-            (scenario_id, as_of_date, input_sha256),
-        ).fetchone()
-        if existing is not None:
-            return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
-        result = scenario_projection(
-            current_price=Decimal(price_row["close_usd"]),
-            price_index_drop_percent=scenario.price_index_drop_percent,
-            routes=routes,
-            inventory=inventory,
-            route_capacity_changes=scenario.route_capacity_changes,
-            demand_changes=scenario.demand_changes,
-        )
         with transaction(self.connection, immediate=True):
+            price_row = self._confirmed_price_row("BRENT", as_of_date)
+            if price_row is None:
+                raise InvalidState("截止日期没有已确认报价")
+            routes = self.connection.execute("SELECT * FROM routes WHERE state='active' ORDER BY route_id").fetchall()
+            inventory = self.connection.execute(
+                "SELECT facility_id,product,sum(CAST(available_barrels AS REAL)) available_barrels "
+                "FROM inventory_lots GROUP BY facility_id,product ORDER BY facility_id,product"
+            ).fetchall()
+            input_value = {
+                "scenario_sha256": row["content_sha256"],
+                "as_of_date": as_of_date,
+                "price_confirmed_id": price_row["confirmed_id"],
+                "price": price_row["close_usd"],
+                "routes": [dict(item) for item in routes],
+                "inventory": [dict(item) for item in inventory],
+            }
+            input_sha256 = digest(input_value)
+            existing = self.connection.execute(
+                "SELECT run_id,result_json FROM scenario_runs WHERE scenario_id=? AND as_of_date=? AND input_sha256=?",
+                (scenario_id, as_of_date, input_sha256),
+            ).fetchone()
+            if existing is not None:
+                return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
+            result = scenario_projection(
+                current_price=Decimal(price_row["close_usd"]),
+                price_index_drop_percent=scenario.price_index_drop_percent,
+                routes=routes,
+                inventory=inventory,
+                route_capacity_changes=scenario.route_capacity_changes,
+                demand_changes=scenario.demand_changes,
+            )
             cursor = self.connection.execute(
                 "INSERT INTO scenario_runs(scenario_id,as_of_date,input_sha256,result_json,created_by,created_at) "
                 "VALUES(?,?,?,?,?,?)",
                 (scenario_id, as_of_date, input_sha256, canonical_json(result), actor_id, self._now()),
             )
             run_id = int(cursor.lastrowid)
+            self._mark_price_consumed(int(price_row["confirmed_id"]), "scenario_run", run_id)
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
-        return {"run_id": run_id, **result, "replayed": False}
+        return {"run_id": run_id, **result, "replayed": False, "price_confirmed_id": int(price_row["confirmed_id"])}
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")

@@ -61,6 +61,25 @@ class JsonApplication:
                 return Response(201, self.service.record_quote(actor, payload))
             if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:
                 return Response(200, self.service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
+            if method == "POST" and path == "/prices/tolerance":
+                return Response(200, self.service.configure_price_tolerance(actor, payload["price_index"], payload["tolerance_usd"]))
+            if method == "GET" and path == "/prices/disputes":
+                return Response(200, self.service.dispute_queue(actor, query.get("price_index", [None])[0]))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["prices", "disputes"]:
+                return Response(200, self.service.dispute(actor, int(parts[2])))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["prices", "disputes"] and parts[3] == "decisions":
+                return Response(201, self.service.resolve_dispute(
+                    actor,
+                    int(parts[2]),
+                    payload["action"],
+                    payload["rationale"],
+                    selected_quote_id=payload.get("selected_quote_id"),
+                    close_usd=payload.get("close_usd"),
+                ))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["prices", "history"]:
+                return Response(200, self.service.price_history(actor, parts[2], query.get("trade_date", [""])[0]))
+            if method == "POST" and path == "/valuation/snapshots":
+                return Response(201, self.service.valuation_snapshot(actor, payload["as_of_date"], payload["positions"]))
             if method == "POST" and path == "/facilities":
                 return Response(201, self.service.create_facility(actor, payload))
             if method == "POST" and path == "/routes":

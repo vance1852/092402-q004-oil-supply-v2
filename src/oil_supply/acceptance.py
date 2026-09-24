@@ -30,7 +30,12 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_scenario("plan", {"scenario_id": "pipeline-restart", "name": "关键管道恢复与需求回落", "price_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
     service.approve_scenario("risk", "pipeline-restart", 1)
     scenario = service.run_scenario("plan", "pipeline-restart", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("BRENT"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    # 两个授权来源对同一交易日报价相差 4 美元，超过容差自动形成争议，独立复核人核定。
+    service.record_quote("plan", {"price_index": "BRENT", "trade_date": "2026-09-24", "close_usd": "97.00", "source_revision": "rev-ice", "observed_at": "2026-09-24T21:00:00Z"})
+    conflicting = service.record_quote("plan", {"price_index": "BRENT", "trade_date": "2026-09-24", "close_usd": "101.00", "source_revision": "rev-exchange", "observed_at": "2026-09-24T21:05:00Z"})
+    adjudication = service.resolve_dispute("risk", conflicting["dispute_id"], "adjudicate", "两家来源凭证齐全，按结算规则取核定值", close_usd="99.00")
+    history = service.price_history("audit", "BRENT", "2026-09-24")
+    result = {"status": "ok", "price": service.price_summary("BRENT"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "dispute_decision_id": adjudication["decision_id"], "price_history_rounds": len(history["confirmed_values"]), "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

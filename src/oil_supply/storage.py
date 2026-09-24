@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS price_index_quotes (
     source_revision TEXT NOT NULL,
     observed_at TEXT NOT NULL,
     supersedes_quote_id INTEGER REFERENCES price_index_quotes(quote_id),
+    round INTEGER NOT NULL DEFAULT 1,
     recorded_by TEXT NOT NULL REFERENCES supply_users(user_id),
     recorded_at TEXT NOT NULL,
     UNIQUE(price_index, trade_date, source_revision)
@@ -34,6 +35,83 @@ CREATE TABLE IF NOT EXISTS price_index_quotes (
 
 CREATE INDEX IF NOT EXISTS idx_quotes_series
 ON price_index_quotes(price_index, trade_date, quote_id);
+
+CREATE TABLE IF NOT EXISTS price_dispute_settings (
+    price_index TEXT PRIMARY KEY,
+    tolerance_usd TEXT NOT NULL,
+    updated_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS price_disputes (
+    dispute_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    price_index TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    round INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','returned','resolved')),
+    tolerance_usd TEXT NOT NULL,
+    max_gap_usd TEXT NOT NULL,
+    anchor_close_usd TEXT,
+    opened_by_quote_id INTEGER NOT NULL REFERENCES price_index_quotes(quote_id),
+    opened_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(price_index, trade_date, round)
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_disputes_state
+ON price_disputes(state, price_index, trade_date);
+
+CREATE TABLE IF NOT EXISTS price_confirmed_values (
+    confirmed_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    price_index TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    round INTEGER NOT NULL,
+    dispute_id INTEGER REFERENCES price_disputes(dispute_id),
+    close_usd TEXT NOT NULL,
+    basis TEXT NOT NULL CHECK(basis IN ('auto_single_source','candidate','adjudicated')),
+    selected_quote_id INTEGER REFERENCES price_index_quotes(quote_id),
+    rationale TEXT NOT NULL,
+    decided_by TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    consumed_at TEXT,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','superseded')),
+    UNIQUE(price_index, trade_date, round)
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_confirmed_series
+ON price_confirmed_values(price_index, trade_date, round);
+
+CREATE TABLE IF NOT EXISTS price_dispute_decisions (
+    decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dispute_id INTEGER NOT NULL REFERENCES price_disputes(dispute_id),
+    action TEXT NOT NULL CHECK(action IN ('select_candidate','adjudicate','return')),
+    selected_quote_id INTEGER REFERENCES price_index_quotes(quote_id),
+    close_usd TEXT,
+    rationale TEXT NOT NULL,
+    decided_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    decided_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_decisions_dispute
+ON price_dispute_decisions(dispute_id, decision_id);
+
+CREATE TABLE IF NOT EXISTS valuation_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of_date TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    price_refs_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS price_value_consumptions (
+    consumption_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    confirmed_id INTEGER NOT NULL REFERENCES price_confirmed_values(confirmed_id),
+    consumer TEXT NOT NULL,
+    reference_id INTEGER NOT NULL,
+    consumed_at TEXT NOT NULL,
+    UNIQUE(confirmed_id, consumer, reference_id)
+);
 
 CREATE TABLE IF NOT EXISTS facilities (
     facility_id TEXT PRIMARY KEY,

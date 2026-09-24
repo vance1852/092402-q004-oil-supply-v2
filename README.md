@@ -5,6 +5,9 @@
 供应调度子域提供以下能力：
 
 - 原油基准报价按交易日和来源修订登记，历史版本不会被覆盖；
+- 同一交易日的候选报价按授权来源分别保留，价差超过可配置容忍度（默认 0.50 美元）时自动形成争议，进入争议队列；
+- 独立复核人（risk 角色）可选择任一候选、录入经核定值或退回补证，提交报价的人不能复核自己参与的记录；复核结论带决定依据并写入审计链；
+- 只有已确认值进入价格摘要、情景运行和估值快照；结论一经下游使用即锁定不可覆盖，迟到候选只能开启新一轮争议，旧值与旧快照原样保留；
 - 油田、储罐、终端与炼厂设施建档，线路保存日能力、在途时间和损耗规则；
 - 线路停运或降容事件按 UTC 时间区间生效，日分配会计算实际可用能力；
 - 库存批次保留油品、牌号、数量、单位成本和接收时间，可计算加权库存成本；
@@ -67,4 +70,14 @@ PYTHONPATH=src python3 -m robot_trials.acceptance --workspace .
 PYTHONPATH=src python3 -m oil_supply.api --database oil_supply.sqlite3 --host 127.0.0.1 --port 8080
 ```
 
-健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖报价、设施、线路、停运事件、库存批次、提名、能力分配、发运、供应情景和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+健康检查为 `GET /health`。除健康检查外，请求通过 `X-Actor-Id` 携带操作者编号。可用接口覆盖报价、报价争议、设施、线路、停运事件、库存批次、提名、能力分配、发运、供应情景、估值快照和审计链。服务重启后，SQLite 中的业务状态和历史版本会继续保留。
+
+报价争议相关接口：
+
+- `POST /quotes`：登记候选报价，返回 `confirmed`、`within_tolerance` 或 `disputed`；
+- `POST /prices/tolerance`：risk 角色配置某基准价容忍度（美元）；
+- `GET /prices/disputes`：争议队列，可按 `price_index` 过滤；
+- `GET /prices/disputes/{id}`：争议详情，含全部候选与上一轮已确认值；
+- `POST /prices/disputes/{id}/decisions`：复核决定，`action` 为 `select_candidate`（带 `selected_quote_id`）、`adjudicate`（带 `close_usd`）或 `return`，均须填写 `rationale`；
+- `GET /prices/history/{index}?trade_date=...`：候选、确认值、争议与决定的完整历史；
+- `POST /valuation/snapshots`：只用已确认值生成估值快照并锁定所用价格结论。
